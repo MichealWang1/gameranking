@@ -269,7 +269,6 @@ public:
 	//从跳表中删除指定键的节点，使用无锁CAS操作保证线程安全
     bool Remove(K key) 
     {
-		Node<K, V>* pstNodeToDelete = nullptr;// 要删除的节点
         bool bIsMarked = false;// 标记节点是否被删除
 		int iBottomLevel = 0;// 最低层级为0
 		Node<K, V>* pstPreds[MAXLEVEL + 1];// 存储各层级的前驱节点
@@ -289,11 +288,155 @@ public:
             for (int level = pstNodeFound->m_iTopLevel; level >= iBottomLevel + 1; ++level)
             {
 				bool bMarked = false;// 标记节点是否被删除
-                // 获取当前层级的前驱动点
+                // 获取当前层级的后继节点
+				Node<K, V>* pstSucc = pstNodeFound->m_pstForward[level].load();
+                while (!bMarked)
+                {
+                    // 标记节点为删除状态
+					pstSucc = pstNodeFound->m_pstForward[level].load();
+					bMarked = pstNodeFound->m_bMarked.load();
+                    if (bMarked)
+                    {
+                        // 节点已被标记，退出循环
+                        break;
+                    }
+                    // 尝试原子标记节点为删除状态
+                    pstNodeFound->m_bMarked.compare_exchange_strong(false, true);
+                }
+
+                //获取当前层级的前驱节点
+				Node<K, V>* pstPred = pstPreds[level];
+                // 获取前驱节点的后继节点
+				Node<K, V>* pstSucc2 = pstPred->m_pstForward[level].load();
+                // 如果前驱节点的后继仍然是当前节点 尝试原子删除节点
+                if (pstSucc2 == pstNodeFound)
+                {
+                    // 从前驱节点中原子移除当前节点
+					pstPred->m_pstForward[level].compare_exchange_strong(pstNodeFound, pstSucc);
+				}
             }
 
-
+            // 确保节点被标记为删除状态
+			bool bMarked = false;// 标记节点是否被删除
+            while (true)
+            {
+				bMarked = pstNodeFound->m_bMarked.load();
+                if (bMarked)
+                {
+                    // 节点已被标记，退出循环
+                    break;
+                }
+				// 尝试原子标记节点为删除状态
+				pstNodeFound->m_bMarked.compare_exchange_strong(false, true);
+            }
+            // 获取最低层级的前驱节点
+            Node<K, V>* pstPred = pstPreds[0];
+			// 获取最低层级的后继节点
+            Node<K, V>* pstSucc = pstNodeFound->m_pstForward[0].load();
+            while (true)
+            {
+                // 检查节点是否已被标记
+                bool bMarkedIt = pstNodeFound->m_bMarked.load();
+				// 获取前驱节点的后继节点
+                Node<K, V>* pstSucc2 = pstPred->m_pstForward[0].load();
+                if (pstSucc2 != pstNodeFound)
+                {
+                    // 如果前驱节点的后继已改变  删除失败，返回
+                    return false;
+                }
+                // 如果节点已被标记 能到这里 说明 pstSucc2 == pstNodeFound 一定是 相等
+                if (bMarkedIt)
+                {
+                    // 原子删除节点 从前驱节点中原子移除当前节点
+                    pstPred->m_pstForward[0].compare_exchange_strong(pstNodeFound, pstSucc);
+					return true;// 返回删除成功
+                }
+            }
         }
+    }
+
+	// 检查跳表中是否包含指定键的节点
+    bool Contains(K key) 
+    {
+		int iBottomLevel = 0;// 最低层级为0
+        Node<K, V>* pstPred = m_stHead;// 从头节点开始
+		Node<K, V>* pstCurr = nullptr;
+        // 从最高层向下遍历
+        for (int level = m_iCurrentLevel; level >= iBottomLevel; --level) 
+        {
+            pstCurr = pstPred->m_pstForward[level];// 获取当前层级的下一个节点
+            // 查找当前层级中第一个不小于目标键的节点
+            while (pstCurr->m_stKey < key)
+            {
+                pstPred = pstCurr;
+				pstCurr = pstPred->m_pstForward[level];// 移动到下一个节点
+            }
+        }
+
+        // 移动到最低层级的下一个节点
+        pstCurr = pstCurr->m_pstForward[iBottomLevel];
+        // 返回是否找到有效节点(键匹配、未标记删除且已完全链接)
+		return (pstCurr->m_stKey == key && !pstCurr->m_bMarked && pstCurr->m_bFullyLinked);
+	}
+
+	V GetValue(K key)
+	{
+		int iBottomLevel = 0;// 最低层级为0
+		Node<K, V>* pstPred = m_stHead;// 从头节点开始
+		Node<K, V>* pstCurr = nullptr;// 存储各层级的后继节点
+		// 从最高层向下遍历
+		for (int level = m_iCurrentLevel; level >= iBottomLevel; --level)
+		{
+			pstCurr = pstPred->m_pstForward[level];// 获取当前层级的下一个节点
+            while (pstCurr->m_stKey < key)
+            {
+				pstPred = pstCurr;// 移动前驱节点
+				pstCurr = pstPred->m_pstForward[level];// 移动到下一个节点
+            }
+		}
+		// 移动到最低层级的下一个节点
+		pstCurr = pstCurr->m_pstForward[iBottomLevel];
+        if (pstCurr->m_stKey == key && !pstCurr->m_bMarked && pstCurr->m_bFullyLinked)
+        {
+			return pstCurr->m_stValue;// 返回节点值
+        }
+
+		return V();// 返回默认值
+	}
+
+    // 获取跳表的当前层级
+    int GetCurrentLevel() 
+    {
+        return m_iCurrentLevel.load();// 返回当前跳表的最高层级
+	}
+
+    // 获取跳表的最大层级
+    int GetMaxLevel() 
+    {
+        return MAXLEVEL;// 返回跳表的最大层级限制
+	}
+
+    // 获取跳表的头节点
+    Node<K, V>* GetHead() 
+    {
+        return &m_stHead;// 返回头节点指针
+    }
+    // 获取跳表的尾节点
+    Node<K, V>* GetTail() 
+    {
+        return &m_stTail;// 返回尾节点指针
+	}
+
+    // 获取跳表的随机数生成器
+    std::mt19937 GetRandomGenerator() 
+    {
+        return m_iRang;// 返回随机数生成器
+	}
+
+    // 获取跳表的概率因子
+    float GetProbability() 
+    {
+        return PROBABILITY;// 返回随机层级生成的概率因子
     }
 };
 
